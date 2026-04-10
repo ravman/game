@@ -35,6 +35,7 @@ function genCode() {
 const GAMES = {
   chain: { name: "Word Chain Duel", icon: "⛓️", desc: "Last letter → first letter. Miss the timer, you're out!", color: "#ff6347", min: 2, max: 6 },
   bluff: { name: "Bluff the Definition", icon: "🎭", desc: "Write fake definitions. Fool your friends. Spot the truth.", color: "#a855f7", min: 3, max: 8 },
+  scramble: { name: "Letter Scramble Race", icon: "🔤", desc: "Same letters, 15 seconds. Longest word wins the round!", color: "#f59e0b", min: 2, max: 8 },
 };
 
 // ─── Word Chain data ───
@@ -79,6 +80,24 @@ const OBSCURE_WORDS = [
   { word: "kibitzer", def: "a person who offers unwanted advice" },
   { word: "limerence", def: "the state of being infatuated with another person" },
 ];
+
+// ─── Scramble data ───
+
+const VOWELS = "AEIOU";
+const CONSONANTS = "BCDFGHJKLMNPQRSTVWXYZ";
+function generateLetters() {
+  const count = 7 + Math.floor(Math.random() * 3); // 7-9 letters
+  const numVowels = Math.max(2, Math.floor(count * 0.35) + Math.floor(Math.random() * 2));
+  const letters = [];
+  for (let i = 0; i < numVowels; i++) letters.push(VOWELS[Math.floor(Math.random() * VOWELS.length)]);
+  for (let i = numVowels; i < count; i++) letters.push(CONSONANTS[Math.floor(Math.random() * CONSONANTS.length)]);
+  // shuffle
+  for (let i = letters.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [letters[i], letters[j]] = [letters[j], letters[i]]; }
+  return letters;
+}
+const SCRAMBLE_ROUNDS = 8;
+const SCRAMBLE_TIME = 15;
+const SCRAMBLE_REVEAL_TIME = 5;
 
 // ─── App Router ───
 
@@ -140,6 +159,7 @@ export default function App() {
       )}
       {screen === "play_chain" && <ChainGame code={roomCode} playerName={playerName} onBack={goHub} />}
       {screen === "play_bluff" && <BluffGame code={roomCode} playerName={playerName} onBack={goHub} />}
+      {screen === "play_scramble" && <ScrambleGame code={roomCode} playerName={playerName} onBack={goHub} />}
     </div>
   );
 }
@@ -286,6 +306,14 @@ function LobbyScreen({ code, name, gameType, onStart, onBack }) {
       r.realDef = OBSCURE_WORDS[idx].def;
       r.usedWordIdxs = [idx];
       r.phaseEnd = Date.now() + 30000;
+    } else if (r.game === "scramble") {
+      r.phase = "playing";
+      r.round = 0;
+      r.scramblePhase = "playing"; // playing | reveal
+      r.letters = generateLetters();
+      r.submissions = [];
+      r.players = r.players.map(p => ({ ...p, score: 0 }));
+      r.phaseEnd = Date.now() + SCRAMBLE_TIME * 1000;
     }
     r.lastUpdate = Date.now();
     await setRoom(code, r);
@@ -916,6 +944,293 @@ function BluffGame({ code, playerName, onBack }) {
                   </div>
                 );
               })}
+            </div>
+          </div>
+        )}
+      </div>
+
+      {/* Timer display */}
+      <div style={{ position: "fixed", bottom: 20, right: 20, fontWeight: 900, fontSize: 28, color: timerColor }}>
+        {localTime}
+      </div>
+    </div>
+  );
+}
+
+// ════════════════════════════════════════
+// GAME 3: LETTER SCRAMBLE RACE
+// ════════════════════════════════════════
+
+function ScrambleGame({ code, playerName, onBack }) {
+  const [room, setRoomState] = useState(null);
+  const [input, setInput] = useState("");
+  const [localTime, setLocalTime] = useState(SCRAMBLE_TIME);
+  const [submitted, setSubmitted] = useState(false);
+  const pollRef = useRef(null);
+  const timerRef = useRef(null);
+  const lastPhaseRef = useRef("");
+  const advancingRef = useRef(false);
+  const inputRef = useRef(null);
+
+  const isHost = room?.players?.[0]?.name === playerName;
+
+  useEffect(() => {
+    let active = true;
+    const poll = async () => {
+      const r = await getRoom(code);
+      if (!active) return;
+      if (r) {
+        setRoomState(r);
+        const phaseKey = `${r.scramblePhase}-${r.round}`;
+        if (phaseKey !== lastPhaseRef.current) {
+          lastPhaseRef.current = phaseKey;
+          advancingRef.current = false;
+          setSubmitted(false);
+          setInput("");
+          const remaining = Math.max(0, Math.ceil((r.phaseEnd - Date.now()) / 1000));
+          setLocalTime(remaining);
+        }
+      }
+      pollRef.current = setTimeout(poll, POLL_MS);
+    };
+    poll();
+    return () => { active = false; clearTimeout(pollRef.current); };
+  }, [code]);
+
+  useEffect(() => {
+    clearInterval(timerRef.current);
+    if (!room || room.phase !== "playing") return;
+    timerRef.current = setInterval(() => {
+      if (!room.phaseEnd) return;
+      const remaining = Math.max(0, Math.ceil((room.phaseEnd - Date.now()) / 1000));
+      setLocalTime(remaining);
+      if (remaining <= 0 && isHost && !advancingRef.current) {
+        advancingRef.current = true;
+        clearInterval(timerRef.current);
+        advanceScramblePhase();
+      }
+    }, 250);
+    return () => clearInterval(timerRef.current);
+  }, [room?.phaseEnd, room?.scramblePhase, room?.round, room?.phase]);
+
+  useEffect(() => {
+    if (room?.scramblePhase === "playing" && !submitted && inputRef.current) inputRef.current.focus();
+  }, [room?.scramblePhase, submitted]);
+
+  const validateWord = (word, letters) => {
+    if (word.length < 2) return false;
+    const available = [...letters.map(l => l.toLowerCase())];
+    for (const ch of word.toLowerCase()) {
+      const idx = available.indexOf(ch);
+      if (idx === -1) return false;
+      available.splice(idx, 1);
+    }
+    return true;
+  };
+
+  const advanceScramblePhase = async () => {
+    const r = await getRoom(code);
+    if (!r || r.phase !== "playing") return;
+
+    if (r.scramblePhase === "playing") {
+      // Score: valid submissions get word length as points, longest gets +3 bonus
+      let maxLen = 0;
+      const scored = [];
+      (r.submissions || []).forEach(s => {
+        const valid = validateWord(s.word, r.letters);
+        const pts = valid ? s.word.length : 0;
+        scored.push({ ...s, valid, pts });
+        if (valid && s.word.length > maxLen) maxLen = s.word.length;
+      });
+      // Bonus for longest
+      scored.forEach(s => {
+        if (s.valid && s.word.length === maxLen && maxLen > 0) s.pts += 3;
+      });
+      // Apply scores
+      r.players = r.players.map(p => {
+        const entry = scored.find(s => s.player === p.name);
+        return { ...p, score: p.score + (entry?.pts || 0) };
+      });
+      r.roundResults = scored;
+      r.scramblePhase = "reveal";
+      r.phaseEnd = Date.now() + SCRAMBLE_REVEAL_TIME * 1000;
+    } else if (r.scramblePhase === "reveal") {
+      const nextRound = r.round + 1;
+      if (nextRound >= SCRAMBLE_ROUNDS) {
+        r.phase = "gameover";
+      } else {
+        r.round = nextRound;
+        r.scramblePhase = "playing";
+        r.letters = generateLetters();
+        r.submissions = [];
+        r.roundResults = [];
+        r.phaseEnd = Date.now() + SCRAMBLE_TIME * 1000;
+      }
+    }
+    r.lastUpdate = Date.now();
+    await setRoom(code, r);
+  };
+
+  const submitWord = async () => {
+    if (!input.trim() || submitted) return;
+    const r = await getRoom(code);
+    if (!r || r.scramblePhase !== "playing") return;
+    if (r.submissions?.some(s => s.player === playerName)) return;
+    r.submissions = [...(r.submissions || []), { player: playerName, word: input.trim().toLowerCase() }];
+    r.lastUpdate = Date.now();
+    await setRoom(code, r);
+    setSubmitted(true);
+  };
+
+  // Game Over
+  if (room?.phase === "gameover" && room?.game === "scramble") {
+    const sorted = [...room.players].sort((a, b) => b.score - a.score);
+    return (
+      <div style={{ minHeight: "100dvh", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", padding: 24 }}>
+        <div className="fade-up" style={{ textAlign: "center" }}>
+          <div style={{ fontSize: 56, marginBottom: 8 }}>🔤</div>
+          <h2 style={{ fontSize: 32, fontWeight: 900, color: "#f59e0b" }}>{sorted[0]?.name} Wins!</h2>
+          <div style={{ color: "var(--sub)", fontSize: 13, marginTop: 4 }}>{SCRAMBLE_ROUNDS} rounds of scrambling</div>
+        </div>
+        <div className="fade-up" style={{ margin: "28px 0", width: "100%", maxWidth: 300, display: "flex", flexDirection: "column", gap: 6 }}>
+          {sorted.map((p, i) => (
+            <div key={i} style={{
+              display: "flex", alignItems: "center", gap: 12, padding: "10px 14px", borderRadius: 10,
+              background: i === 0 ? "var(--card)" : "transparent",
+              border: `2px solid ${i === 0 ? "#f59e0b" : "transparent"}`
+            }}>
+              <span style={{ fontWeight: 900, fontSize: 13, color: "var(--sub)", width: 28 }}>#{i + 1}</span>
+              <span style={{ flex: 1, fontWeight: 700 }}>{p.name}</span>
+              <span style={{ fontWeight: 800, color: "#f59e0b" }}>{p.score}</span>
+            </div>
+          ))}
+        </div>
+        <button className="btn" style={{ maxWidth: 300, background: "#f59e0b", color: "#fff" }} onClick={onBack}>Back to Menu</button>
+      </div>
+    );
+  }
+
+  if (!room) return <Loading />;
+
+  const totalTime = room.scramblePhase === "playing" ? SCRAMBLE_TIME : SCRAMBLE_REVEAL_TIME;
+  const timerPct = (localTime / totalTime) * 100;
+  const timerColor = localTime <= 3 ? "var(--red)" : localTime <= 7 ? "var(--accent2)" : "#f59e0b";
+  const alreadySubmitted = room.submissions?.some(s => s.player === playerName);
+
+  return (
+    <div style={{ minHeight: "100dvh", display: "flex", flexDirection: "column" }}>
+      {/* Header */}
+      <div style={{ padding: "10px 16px", borderBottom: "1px solid var(--border)", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+        <button onClick={onBack} style={{ background: "none", border: "none", color: "var(--sub)", cursor: "pointer", fontSize: 13 }}>✕</button>
+        <span style={{ fontSize: 11, color: "var(--sub)", letterSpacing: 3, textTransform: "uppercase" }}>
+          Round {room.round + 1}/{SCRAMBLE_ROUNDS}
+        </span>
+        <span style={{ fontSize: 12, color: "var(--sub)" }}>{code}</span>
+      </div>
+
+      {/* Timer bar */}
+      <div style={{ height: 4, background: "var(--border)", margin: "0 16px", borderRadius: 2, overflow: "hidden" }}>
+        <div style={{ height: "100%", width: `${timerPct}%`, background: timerColor, borderRadius: 2, transition: "width 0.3s linear" }} />
+      </div>
+
+      {/* Scores strip */}
+      <div style={{ display: "flex", gap: 8, padding: "10px 16px", overflowX: "auto", flexShrink: 0 }}>
+        {room.players.map((p, i) => (
+          <div key={i} style={{
+            padding: "5px 12px", borderRadius: 20, fontSize: 12, fontWeight: 700, whiteSpace: "nowrap",
+            background: "var(--card)", color: "var(--text)", border: "2px solid var(--border)"
+          }}>
+            {p.name}{p.name === playerName ? " •" : ""} <span style={{ color: "#f59e0b" }}>{p.score}</span>
+          </div>
+        ))}
+      </div>
+
+      {/* Letters display */}
+      <div style={{ textAlign: "center", padding: "24px 20px 16px" }}>
+        <div style={{ fontSize: 11, color: "var(--sub)", letterSpacing: 3, textTransform: "uppercase", marginBottom: 14 }}>
+          {room.scramblePhase === "playing" ? "Make the longest word" : "Results"}
+        </div>
+        <div style={{ display: "flex", justifyContent: "center", gap: 6, flexWrap: "wrap" }}>
+          {room.letters?.map((l, i) => (
+            <div key={i} style={{
+              width: 44, height: 52, borderRadius: 10, background: "var(--card)", border: "2px solid var(--border)",
+              display: "flex", alignItems: "center", justifyContent: "center",
+              fontSize: 24, fontWeight: 900, color: "#f59e0b",
+              animation: `fadeUp 0.3s ease ${i * 0.05}s both`
+            }}>{l}</div>
+          ))}
+        </div>
+      </div>
+
+      {/* Phase content */}
+      <div style={{ flex: 1, padding: "12px 20px 140px", overflowY: "auto" }}>
+
+        {/* PLAYING PHASE */}
+        {room.scramblePhase === "playing" && (
+          <div className="fade-up" style={{ maxWidth: 400, margin: "0 auto", textAlign: "center" }}>
+            {alreadySubmitted || submitted ? (
+              <div style={{ padding: 32 }}>
+                <div style={{ fontSize: 28, marginBottom: 8 }}>✅</div>
+                <div style={{ color: "var(--sub)", fontSize: 14 }}>Locked in! Waiting for others...</div>
+                <div style={{ color: "var(--sub)", fontSize: 12, marginTop: 8 }}>
+                  {room.submissions?.length}/{room.players.length} submitted
+                </div>
+              </div>
+            ) : (
+              <div style={{ display: "flex", gap: 10, alignItems: "center", maxWidth: 360, margin: "0 auto" }}>
+                <input
+                  ref={inputRef} value={input}
+                  onChange={e => setInput(e.target.value.replace(/[^a-zA-Z]/g, ""))}
+                  onKeyDown={e => e.key === "Enter" && submitWord()}
+                  placeholder="Your word..."
+                  className="input"
+                  style={{ flex: 1, fontSize: 22, fontWeight: 700, textTransform: "uppercase", textAlign: "center", padding: "14px 16px" }}
+                  autoComplete="off" autoCorrect="off" autoCapitalize="off" spellCheck="false"
+                />
+                <button onClick={submitWord} style={{
+                  width: 50, height: 50, borderRadius: 12, background: "#f59e0b", border: "none",
+                  color: "#fff", fontSize: 22, fontWeight: 900, cursor: "pointer", flexShrink: 0
+                }}>→</button>
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* REVEAL PHASE */}
+        {room.scramblePhase === "reveal" && (
+          <div className="fade-up" style={{ maxWidth: 400, margin: "0 auto" }}>
+            <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+              {(room.roundResults || [])
+                .sort((a, b) => b.pts - a.pts)
+                .map((r, i) => (
+                <div key={i} style={{
+                  display: "flex", alignItems: "center", gap: 12, padding: "10px 14px", borderRadius: 10,
+                  background: "var(--card)", border: `2px solid ${r.pts > 0 ? "#f59e0b" : "var(--border)"}`
+                }}>
+                  <span style={{ fontWeight: 700, fontSize: 14, flex: 1 }}>{r.player}</span>
+                  <span style={{
+                    fontWeight: 800, fontSize: 16, textTransform: "uppercase",
+                    color: r.valid ? "var(--text)" : "var(--red)",
+                    textDecoration: r.valid ? "none" : "line-through"
+                  }}>{r.word}</span>
+                  <span style={{ fontWeight: 800, color: r.pts > 0 ? "var(--green)" : "var(--sub)", minWidth: 36, textAlign: "right" }}>
+                    +{r.pts}
+                  </span>
+                </div>
+              ))}
+              {/* Players who didn't submit */}
+              {room.players
+                .filter(p => !(room.roundResults || []).some(r => r.player === p.name))
+                .map((p, i) => (
+                <div key={`ns-${i}`} style={{
+                  display: "flex", alignItems: "center", gap: 12, padding: "10px 14px", borderRadius: 10,
+                  background: "var(--card)", border: "2px solid var(--border)", opacity: 0.4
+                }}>
+                  <span style={{ fontWeight: 700, fontSize: 14, flex: 1 }}>{p.name}</span>
+                  <span style={{ fontSize: 12, color: "var(--sub)" }}>no answer</span>
+                  <span style={{ fontWeight: 800, color: "var(--sub)", minWidth: 36, textAlign: "right" }}>+0</span>
+                </div>
+              ))}
             </div>
           </div>
         )}
