@@ -6,14 +6,20 @@ const POLL_MS = 600;
 
 async function getRoom(code) {
   try {
-    const r = await window.storage.get(`wpa:${code}`, true);
-    return r ? JSON.parse(r.value) : null;
+    const r = await fetch(`/api/room/${code.toUpperCase()}`);
+    if (!r.ok) return null;
+    const data = await r.json();
+    return data;
   } catch { return null; }
 }
 
 async function setRoom(code, data) {
   try {
-    await window.storage.set(`wpa:${code}`, JSON.stringify(data), true);
+    await fetch(`/api/room/${code.toUpperCase()}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(data),
+    });
   } catch (e) { console.error("Storage error", e); }
 }
 
@@ -352,7 +358,7 @@ function LobbyScreen({ code, name, gameType, onStart, onBack }) {
 // GAME 1: WORD CHAIN DUEL
 // ════════════════════════════════════════
 
-const CHAIN_TURN_TIME = 7;
+const CHAIN_TURN_TIME = 10;
 
 function ChainGame({ code, playerName, onBack }) {
   const [room, setRoomState] = useState(null);
@@ -430,11 +436,33 @@ function ChainGame({ code, playerName, onBack }) {
 
   useEffect(() => { if (isMyTurn && inputRef.current) inputRef.current.focus(); }, [isMyTurn]);
 
+  const [validating, setValidating] = useState(false);
+  const [wordError, setWordError] = useState("");
+
   const submitWord = async () => {
-    if (!isMyTurn) return;
+    if (!isMyTurn || validating) return;
     const word = input.trim().toLowerCase();
     if (word.length < 2) return;
     if (requiredLetter && word[0] !== requiredLetter) { setShaking(true); setTimeout(() => setShaking(false), 500); return; }
+
+    setValidating(true);
+    setWordError("");
+    try {
+      const res = await fetch(`https://api.dictionaryapi.dev/api/v2/entries/en/${encodeURIComponent(word)}`);
+      if (!res.ok) {
+        setWordError(`"${word}" not in dictionary`);
+        setShaking(true); setTimeout(() => setShaking(false), 500);
+        setValidating(false);
+        return;
+      }
+    } catch {
+      setWordError("Dictionary check failed — try again");
+      setValidating(false);
+      return;
+    }
+    setValidating(false);
+
+
     const r = await getRoom(code);
     if (!r || r.phase !== "playing" || r.currentIdx !== myIdx) return;
     if (r.usedWords.includes(word)) {
@@ -528,6 +556,17 @@ function ChainGame({ code, playerName, onBack }) {
         ))}
         {room.message && <div style={{ textAlign: "center", color: "var(--red)", fontWeight: 700, fontSize: 13, padding: 10 }}>{room.message}</div>}
       </div>
+
+      {(wordError || validating) && (
+        <div style={{
+          position: "fixed", bottom: 88, left: 16, right: 16, textAlign: "center",
+          fontSize: 13, fontWeight: 700, color: validating ? "var(--sub)" : "var(--red)",
+          background: "var(--card)", border: "2px solid var(--border)", borderRadius: 10,
+          padding: "8px 14px", animation: "fadeUp 0.2s ease"
+        }}>
+          {validating ? "Checking dictionary..." : wordError}
+        </div>
+      )}
       <div style={{
         position: "fixed", bottom: 0, left: 0, right: 0, padding: "12px 16px 28px",
         background: "var(--bg)", borderTop: "1px solid var(--border)", display: "flex", gap: 10, alignItems: "center"
@@ -540,13 +579,16 @@ function ChainGame({ code, playerName, onBack }) {
                 display: "flex", alignItems: "center", justifyContent: "center", fontWeight: 900, fontSize: 20, flexShrink: 0, textTransform: "uppercase"
               }}>{requiredLetter}</div>
             )}
-            <input ref={inputRef} value={input} onChange={e => setInput(e.target.value.replace(/[^a-zA-Z]/g, ""))}
+            <input ref={inputRef} value={input}
+              onChange={e => { setInput(e.target.value.replace(/[^a-zA-Z]/g, "")); setWordError(""); }}
               onKeyDown={e => e.key === "Enter" && submitWord()} placeholder="Type a word..." className="input"
-              style={{ flex: 1, fontSize: 20, fontWeight: 700, textTransform: "lowercase", padding: "12px 14px", animation: shaking ? "shake 0.4s" : "none" }}
+              disabled={validating}
+              style={{ flex: 1, fontSize: 20, fontWeight: 700, textTransform: "lowercase", padding: "12px 14px", animation: shaking ? "shake 0.4s" : "none", opacity: validating ? 0.5 : 1 }}
               autoComplete="off" autoCorrect="off" autoCapitalize="off" spellCheck="false" />
-            <button onClick={submitWord} style={{
+            <button onClick={submitWord} disabled={validating} style={{
               width: 44, height: 44, borderRadius: 12, background: "var(--accent)", border: "none",
-              color: "#fff", fontSize: 20, fontWeight: 900, cursor: "pointer", flexShrink: 0
+              color: "#fff", fontSize: 20, fontWeight: 900, cursor: validating ? "default" : "pointer",
+              flexShrink: 0, opacity: validating ? 0.5 : 1
             }}>→</button>
           </>
         ) : (
